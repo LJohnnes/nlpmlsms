@@ -1,0 +1,381 @@
+---
+title: "SMS spam filtering - edits"
+author: "Xuan ++Lionel"
+date: "June 19, 2016"
+output: html_document
+---
+
+APPLYING MACHINE LEARNING ON SMS SPAM FILTERING
+
+As worldwide use of mobile phones has grown, a new avenue for electronic junk mail has been opened for disreputable marketers. These advertisers utilize Short Message Service (SMS) text messages to target potential consumers with unwanted advertising known as SMS spam. This type of spam is particularly troublesome because, unlike email spam, many cellular phone users pay a fee per SMS received. Developing a classification algorithm that could filter SMS spam would provide a useful tool for cellular phone providers to protect their users from spam.
+
+Since Naive Bayes has been used successfully for email spam filtering, it seems likely that it could also be applied to SMS spam. However, relative to email spam, SMS spam poses additional challenges for automated filters. SMS messages are often limited to 160 characters, reducing the amount of text that can be used to identify whether a message is junk. The limit, combined with small mobile phone keyboards, has led many to adopt a form of SMS shorthand lingo, which further blurs the line between legitimate messages and spam.
+
+For our final project, we applied ML with Naive Bayes for SMS spam filtering, using a training dataset that we found on http://www.dt.fee.unicamp.br/~tiago/smsspamcollection/
+
+Major steps:
+1. Load data and create a corpus (create, clean, tokenize), create sparse matrix.
+2. Partition to training and testing dataset.
+3. Create indicator features for frequent words
+4. Train model with Naive Bayes on training set.
+5. Evaluate model performance.
+6. Improve model performance.
+7. Check and visualize accuracy with different training size.
+8. Try other model: Decision Tree, SVM...
+
+```{r}
+#Load libraries
+library(NLP)
+library(tm) #for text mining
+library(wordcloud) #for visualization
+library(e1071) #for modeling Naive Bayes, SVM
+library(gmodels) #for evaluation
+library(C50) #for modeling Decision Tree
+library(caret) #for getting confusion matrix
+library(ggplot2) #for plotting
+library(kernlab) #for SVM
+library(SnowballC) #for stemming
+```
+
+1. Loading, exploring and preparing data.
+```{r}
+# Load dataset
+sms_raw <- read.csv("sms_spam.csv", stringsAsFactors = FALSE)
+str(sms_raw)
+View(sms_raw) #dataset has 5.574 observations with 4.827 ham and 747 spam
+sms_raw$type <- as.factor(sms_raw$type) #change type to factor, instead of character
+table(sms_raw$type) 
+
+# Data Preparation
+
+# Create a Corpus
+sms_corpus <- Corpus(VectorSource(sms_raw$text))
+print(sms_corpus) #Corpus contains 5.574 documents
+
+# Take a look at the content
+inspect(sms_corpus[1:3])
+writeLines(as.character(sms_corpus[[1]]))
+lapply(sms_corpus[1:3], as.character)
+meta(sms_corpus[[1]])
+
+# Clean Corpus
+corpus_clean <- tm_map(sms_corpus, content_transformer(tolower))
+corpus_clean <- tm_map(corpus_clean, removeNumbers)
+corpus_clean <- tm_map(corpus_clean, removeWords, stopwords("english")) #remove stopwords
+corpus_clean <- tm_map(corpus_clean, removePunctuation) #remove punctuation
+corpus_clean_s <- tm_map(corpus_clean, stemDocument) # version with stemming
+
+# Clean both versions of white spaces 
+corpus_clean <- tm_map(corpus_clean, stripWhitespace) #remove additional white space
+corpus_clean_s <- tm_map(corpus_clean_s, stripWhitespace) #remove additional white space
+
+# Tokenization (create a sparse matrix)
+sms_dtm <- DocumentTermMatrix(corpus_clean) #version without stemming
+sms_dtm_s <- DocumentTermMatrix(corpus_clean_s) #version with stemming
+sms_dtm_s_post <- DocumentTermMatrix(corpus_clean,control = list(stemming=TRUE)) #stemmed version post DTM creation
+
+```
+
+2. Partition to training and testing sets (80:20).
+```{r}
+# Set the seed to make your partition reproductible
+set.seed(123)
+index <- sample(seq_len(nrow(sms_raw)), floor(0.8*nrow(sms_raw)))
+
+# Partition raw dataset
+sms_raw_train <- sms_raw[index, ]
+sms_raw_test <- sms_raw[-index, ]
+
+# Partition sparse matrix
+sms_dtm_train <- sms_dtm[index, ]
+sms_dtm_test <- sms_dtm[-index, ]
+
+# Partition corpus
+sms_corpus_train <- corpus_clean[index]
+sms_corpus_test <- corpus_clean[-index]
+
+# Check to make sure spam propotion is divided fairly between 2 sets. Here we see spam accounts for approximately 13% of all datasets.
+prop.table(table(sms_raw_train$type))
+prop.table(table(sms_raw_test$type))
+prop.table(table(sms_raw$type))
+
+# Visualize a word cloud from corpus
+wordcloud(sms_corpus_train, min.freq = 40, random.order = FALSE)
+spam <- subset(sms_raw_train, type == "spam")
+ham <- subset(sms_raw_train, type == "ham")
+wordcloud(spam$text, max.words = 40, scale = c(3, 0.5))
+wordcloud(ham$text, max.words = 40, scale = c(3, 0.5))
+
+#For spam, most frequent words are: call, free, now, mobile, txt, text, prize, claim, reply, stop, get, you.
+
+#For ham, most frequent words are: just, will, can, now, come, got, call, dont, like, ltgt, know, you, time, good, going...
+
+
+# Partitioning repeated for both stemmed versions below
+
+# Partition sparse matrix - stemmed during pre-processing
+sms_dtm_train_s <- sms_dtm_s[index, ]
+sms_dtm_test_s <- sms_dtm_s[-index, ]
+
+# Partition sparse matrix - stemmed post processing
+sms_dtm_train_s_post <- sms_dtm_s_post[index, ]
+sms_dtm_test_s_post <- sms_dtm_s_post[-index, ]
+
+# Partition stemmed corpus
+sms_corpus_train_s <- corpus_clean_s[index]
+sms_corpus_test_s <- corpus_clean_s[-index]
+
+```
+
+
+3. Create indicator features for frequent words.
+```{r}
+# Create a dictionary with words that appear in more or equal to 5 SMS from sparse matrix (i.e 0.1% of the whole dataset).
+sms_dict <- findFreqTerms(sms_dtm_train, 5)
+sms_train <- DocumentTermMatrix(sms_corpus_train, list(dictionary = sms_dict))
+sms_test <- DocumentTermMatrix(sms_corpus_test, list(dictionary = sms_dict))
+
+# Here we can see training and testing data includes 1295 features corresponding only to words that appear in at least 5 SMS.
+sms_train
+sms_test
+
+# Define a function that converts count to factor
+convert_counts <- function(x){
+  x <- ifelse(x > 0, 1, 0)
+  x <- factor(x, levels = c(0, 1), labels = c("No", "Yes"))
+  return(x)}
+
+# Apply that function to training and testing sets (MARGIN = 2 means columns, rather than MARGIN = 1 means rows)
+sms_train <- apply(sms_train, MARGIN = 2, convert_counts)
+sms_test <- apply(sms_test, MARGIN = 2, convert_counts)
+
+
+# Repeat feature indication for stemmed sets
+sms_dict_s <- findFreqTerms(sms_dtm_train_s, 5)
+sms_train_s <- DocumentTermMatrix(sms_corpus_train_s, list(dictionary = sms_dict_s))
+sms_test_s <- DocumentTermMatrix(sms_corpus_test_s, list(dictionary = sms_dict_s))
+
+sms_dict_s_post <- findFreqTerms(sms_dtm_train_s_post, 5)
+sms_train_s_post <- DocumentTermMatrix(sms_corpus_train, list(dictionary = sms_dict_s_post, stemming=TRUE))
+sms_test_s_post <- DocumentTermMatrix(sms_corpus_test, list(dictionary = sms_dict_s_post, stemming=TRUE))
+
+# Looking at the train and test sets for all three versions, we can see that while the number of documents (4459 for train and 1115 for test) and number of terms (1213) remains consistent, the term sparsity varies. For example, the ratio of non-/sparse entries are approximately 0.0045 for the non-stemmed version, 0.0037 for the version stemmed during pre-processing and 0.005 for the post-stemmed version. NOTE: The post-stem version becomes equivalent to the pre-stem when the stemming=TRUE parameter is added to the above DTM. This was required in order to run the classifier model below.
+
+sms_train_s
+sms_test_s
+
+sms_train_s_post
+sms_test_s_post
+
+
+# Apply our custom function to training and testing sets (MARGIN = 2 means columns, rather than MARGIN = 1 means rows)
+sms_train_s <- apply(sms_train_s, MARGIN = 2, convert_counts)
+sms_test_s <- apply(sms_test_s, MARGIN = 2, convert_counts)
+
+sms_train_s_post <- apply(sms_train_s_post, MARGIN = 2, convert_counts)
+sms_test_s_post <- apply(sms_test_s_post, MARGIN = 2, convert_counts)
+
+```
+
+4. Train model with Naive Bayes on training set.
+```{r}
+sms_classifier <- naiveBayes(sms_train, sms_raw_train$type)
+
+# Build models for stemmed versions
+sms_classifier_s <- naiveBayes(sms_train_s, sms_raw_train$type)
+#sms_classifier_s_post <- naiveBayes(sms_train_s_post, sms_raw_train$type)
+
+```
+
+5. Evaluate model performance. We need high spams caught and low blocked hams.
+Spams caught (SC) = False negative cases/Number of spam
+Blocked hams (BH) = False positive cases/Number of hams
+Cost function (assumption): 1 blocked ham costs x times as much as a passed spam, as it may contain important information for end-users.
+```{r}
+sms_test_pred <- predict(sms_classifier, sms_test)
+confusion_matrix <- CrossTable(sms_test_pred, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c('predicted', 'actual'))
+accuracy <- (confusion_matrix$t[1,1] + confusion_matrix$t[2,2])/(confusion_matrix$t[1,1] + confusion_matrix$t[2,2] + confusion_matrix$t[1,2] + confusion_matrix$t[2,1])*100
+spam_caught <- confusion_matrix$t[2,2]/(confusion_matrix$t[1,2] + confusion_matrix$t[2,2])*100
+ham_blocked <- confusion_matrix$t[2,1]/(confusion_matrix$t[1,1] + confusion_matrix$t[2,1])*100
+accuracy
+spam_caught
+ham_blocked
+
+# Spams caught = 140/150 = 93.3%. Blocked hams = 2/965 = 0.2%. Accuracy = (963 + 140)/1115 = 98.9%
+
+# We can see blocked hams is quite good but spams caught is not ideal, there is still 6.7% spam SMS are treated as ham. We will investigate this.
+
+
+# Repeat evaluation for the version during pre-processing. The version stemmed during DTM creation will have the same results as long as sparsity is equivalent.
+sms_test_pred_s <- predict(sms_classifier_s, sms_test_s)
+confusion_matrix_s <- CrossTable(sms_test_pred_s, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c('predicted', 'actual'))
+accuracy_s <- (confusion_matrix_s$t[1,1] + confusion_matrix_s$t[2,2])/(confusion_matrix_s$t[1,1] + confusion_matrix_s$t[2,2] + confusion_matrix_s$t[1,2] + confusion_matrix_s$t[2,1])*100
+spam_caught_s <- confusion_matrix_s$t[2,2]/(confusion_matrix_s$t[1,2] + confusion_matrix_s$t[2,2])*100
+ham_blocked_s <- confusion_matrix_s$t[2,1]/(confusion_matrix_s$t[1,1] + confusion_matrix_s$t[2,1])*100
+accuracy_s
+spam_caught_s
+ham_blocked_s
+
+# As we can see, the non-stemmed version has slightly better performance. The only difference in performance against this test set is that the stemmed data trains a model predicting 1 spam document  as ham, resulting in a 98.83% accuracy, versus 98.92% without stemming.
+
+```
+
+6. Improve model performance.
+```{r}
+sms_classifier1 <- naiveBayes(sms_train, sms_raw_train$type, laplace = 1)
+sms_test_pred1 <- predict(sms_classifier1, sms_test)
+confusion_matrix1 <- CrossTable(sms_test_pred1, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c('predicted','actual'))
+accuracy1 = (confusion_matrix1$t[1,1] + confusion_matrix1$t[2,2])/(confusion_matrix1$t[1,1] + confusion_matrix1$t[2,2] + confusion_matrix1$t[1,2] + confusion_matrix1$t[2,1])*100
+spam_caught1 <- confusion_matrix1$t[2,2]/(confusion_matrix1$t[1,2] + confusion_matrix1$t[2,2])*100
+ham_blocked1 <- confusion_matrix1$t[2,1]/(confusion_matrix1$t[1,1] + confusion_matrix1$t[2,1])*100
+accuracy1
+spam_caught1
+ham_blocked1
+
+# Spam caught = 136/150 = 90.7% (worse). Blocked hams = 1/965 = 0.1% (better). But we'd rather take lower blocked hams so this model is better.
+
+# Repeat for stemmed models
+sms_classifier_s1 <- naiveBayes(sms_train_s, sms_raw_train$type,laplace = 1)
+sms_test_pred_s1 <- predict(sms_classifier_s1, sms_test_s)
+confusion_matrix_s1 <- CrossTable(sms_test_pred_s1, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c('predicted','actual'))
+accuracy_s1 = (confusion_matrix_s1$t[1,1] + confusion_matrix_s1$t[2,2])/(confusion_matrix_s1$t[1,1] + confusion_matrix_s1$t[2,2] + confusion_matrix_s1$t[1,2] + confusion_matrix_s1$t[2,1])*100
+spam_caught_s1 <- confusion_matrix_s1$t[2,2]/(confusion_matrix_s1$t[1,2] + confusion_matrix_s1$t[2,2])*100
+ham_blocked_s1 <- confusion_matrix_s1$t[2,1]/(confusion_matrix_s1$t[1,1] + confusion_matrix_s1$t[2,1])*100
+accuracy_s1
+spam_caught_s1
+ham_blocked_s1
+
+# With the laplace estimator of 1 added to the model parameters, there is no improvement in performance with the stemmed data set. Rather, the results for spam caught (90%), blocked ham (0.2%) and accuracy (98.47%) are all worse than the non-stemmed model with Laplace estimator.
+
+```
+
+7. Check and visualize accuracy with different training set size
+```{r}
+# Fix testing size
+test_size <- 574
+raw_test <- sms_raw[(nrow(sms_raw) - test_size): nrow(sms_raw),]
+dtm_test <- sms_dtm[(nrow(sms_raw) - test_size): nrow(sms_raw),]
+corpus_test <- corpus_clean[(nrow(sms_raw) - test_size): nrow(sms_raw)]
+accuracy_dt <- c()
+training_size <- c()
+blocked_ham <- c()
+spam_caught <- c()
+max_train_size <- nrow(sms_raw) - test_size
+
+# Note: adjust the sequence intervals if the code takes too long to run as-is below. With interval=5 it should take no longer than a couple of minutes.
+
+for (i in seq(1,floor(max_train_size/100),1)){
+  train_size <- i * 100
+  #Partition training set
+  raw_train <- sms_raw[1:train_size, ]
+  dtm_train <- sms_dtm[1:train_size, ]
+  corpus_train <- corpus_clean[1:train_size]
+  #Create indicator features
+  dict <- findFreqTerms(dtm_train, 5)
+  train <- DocumentTermMatrix(corpus_train, list(dictionary = dict))
+  test <- DocumentTermMatrix(corpus_test, list(dictionary = dict))
+  #convert count to factor
+  train <- apply(train, MARGIN = 2, convert_counts)
+  test <- apply(test, MARGIN = 2, convert_counts)
+  #train a Naive Bayes model and predict in test set
+  smsclassifier <- naiveBayes(train, raw_train$type, laplace = 1)
+  test_pred <- predict(smsclassifier, test)
+  #evaluate
+  cm <- confusionMatrix(test_pred, raw_test$type)
+  accuracy_dt[i] <- (cm$table[1,1] + cm$table[2,2])/(cm$table[1,1] + cm$table[1,2] + cm$table[2,1] + cm$table[2,2])*100
+  training_size[i] <- train_size
+  spam_caught[i] <- cm$table[2,2]/(cm$table[1,2] + cm$table[2,2])*100
+  blocked_ham[i] <- cm$table[2,1]/(cm$table[1,1] + cm$table[2,1])*100
+}
+plot(training_size,accuracy_dt)
+lines(training_size, accuracy_dt)
+plot(training_size, spam_caught)
+lines(training_size, spam_caught)
+plot(training_size, blocked_ham)
+lines(training_size, blocked_ham)
+```
+
+8. Decision Tree modeling
+```{r}
+# C5.0
+sms_c5 <- C5.0(sms_train, sms_raw_train$type)
+sms_test_pred2 <- predict(sms_c5, sms_test)
+confusion_matrix_c5 <- CrossTable(sms_test_pred2, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c("predicted", "actual"))
+accuracy_c5 <- (confusion_matrix_c5$t[1,1] + confusion_matrix_c5$t[2,2])/(confusion_matrix_c5$t[1,1] + confusion_matrix_c5$t[2,2] + confusion_matrix_c5$t[1,2] + confusion_matrix_c5$t[2,1])*100 #96.8%
+spam_caught_c5 <- confusion_matrix_c5$t[2,2]/(confusion_matrix_c5$t[1,2] + confusion_matrix_c5$t[2,2])*100 #87.3%
+ham_blocked_c5 <- confusion_matrix_c5$t[2,1]/(confusion_matrix_c5$t[1,1] + confusion_matrix_c5$t[2,1])*100 #1.76%
+
+# Boosting accuracy of Decision Tree
+sms_c5_boosting10 <- C5.0(sms_train, sms_raw_train$type, trials = 10)
+sms_c5_boosting10
+sms_test_pred3 <- predict(sms_c5_boosting10, sms_test)
+confusion_matrix_boosting10 <- CrossTable(sms_test_pred3, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c("predicted", "actual"))
+accuracy_boosting10 <- (confusion_matrix_boosting10$t[1,1] + confusion_matrix_boosting10$t[2,2])/(confusion_matrix_boosting10$t[1,1] + confusion_matrix_boosting10$t[2,2] + confusion_matrix_boosting10$t[1,2] + confusion_matrix_boosting10$t[2,1])*100 #97.2%
+spam_caught_boosting10 <- confusion_matrix_boosting10$t[2,2]/(confusion_matrix_boosting10$t[1,2] + confusion_matrix_boosting10$t[2,2])*100 # 83.33%
+
+ham_blocked_boosting10 <- confusion_matrix_boosting10$t[2,1]/(confusion_matrix_boosting10$t[1,1] + confusion_matrix_boosting10$t[2,1])*100 # 0.62%
+
+# After boosting, we see accuracy and blocked ham are improved while spam caught is reduce, but in overall, it's much better.
+
+# Apply cost to the model
+error_cost <- matrix(c(0, 2, 1, 0), nrow = 2)
+error_cost
+c5_cost <- C5.0(sms_train, sms_raw_train$type, costs = error_cost)
+sms_c5_cost_pred <- predict(c5_cost, sms_test)
+confusion_matrix_cost <- CrossTable(sms_c5_cost_pred, sms_raw_test$type, prop.chisq = FALSE, prop.t = FALSE, dnn = c("predicted", "actual"))
+accuracy_c5_cost <- (confusion_matrix_cost$t[1,1] + confusion_matrix_cost$t[2,2])/(confusion_matrix_cost$t[1,1] + confusion_matrix_cost$t[2,2] + confusion_matrix_cost$t[1,2] + confusion_matrix_cost$t[2,1])*100 
+spam_caught_c5_cost <- confusion_matrix_cost$t[2,2]/(confusion_matrix_cost$t[1,2] + confusion_matrix_cost$t[2,2])*100 
+ham_blocked_c5_cost <- confusion_matrix_cost$t[2,1]/(confusion_matrix_cost$t[1,1] + confusion_matrix_cost$t[2,1])*100 
+
+# With cost function of c(0,9,1,0), accuracy = 90.5%, spam caught = 29.33%, blocked ham = 0 %.
+# With cost function of c(0,5,1,0), accuracy = 93.6%, spam caught =54%, blocked ham = 0.2 %.
+# With cost function of c(0,3,1,0), accuracy = 95.2%, spam caught = 66%, blocked ham = 0.2 %.
+# With cost function of c(0,2,1,0), accuracy = 96%, spam caught = 72%, blocked ham = 0.3 %.
+```
+
+Train C5.0 with cost function for different training size
+
+```{r}
+# Fix testing size
+test_size <- 574
+raw_test <- sms_raw[(nrow(sms_raw) - test_size): nrow(sms_raw),]
+dtm_test <- sms_dtm[(nrow(sms_raw) - test_size): nrow(sms_raw),]
+corpus_test <- corpus_clean[(nrow(sms_raw) - test_size): nrow(sms_raw)]
+
+accuracy_dt <- c()
+training_size <- c()
+blocked_ham <- c()
+spam_caught <- c()
+max_train_size <- nrow(sms_raw) - test_size
+error_cost <- error_cost <- matrix(c(0, 3, 1, 0), nrow = 2)
+for (i in 1:floor(max_train_size/100)){
+  train_size <- i * 100
+  #Partition training set
+  raw_train <- sms_raw[1:train_size, ]
+  dtm_train <- sms_dtm[1:train_size, ]
+  corpus_train <- corpus_clean[1:train_size]
+  #Create indicator features
+  dict <- findFreqTerms(dtm_train, 5)
+  train <- DocumentTermMatrix(corpus_train, list(dictionary = dict))
+  test <- DocumentTermMatrix(corpus_test, list(dictionary = dict))
+  #convert count to factor
+  train <- apply(train, MARGIN = 2, convert_counts)
+  test <- apply(test, MARGIN = 2, convert_counts)
+  #train a C5.0 model with cost function and predict in test set
+  smsc5_cost <- C5.0(train, raw_train$type, costs = error_cost)
+  test_pred <- predict(smsc5_cost, test)
+  #evaluate
+  cm <- confusionMatrix(test_pred, raw_test$type)
+  accuracy_dt[i] <- (cm$table[1,1] + cm$table[2,2])/(cm$table[1,1] + cm$table[1,2] + cm$table[2,1] + cm$table[2,2])*100
+  training_size[i] <- train_size
+  spam_caught[i] <- cm$table[2,2]/(cm$table[1,2] + cm$table[2,2])*100
+  blocked_ham[i] <- cm$table[2,1]/(cm$table[1,1] + cm$table[2,1])*100
+}
+plot(training_size,accuracy_dt)
+lines(training_size, accuracy_dt)
+plot(training_size, spam_caught)
+lines(training_size, spam_caught)
+plot(training_size, blocked_ham)
+lines(training_size, blocked_ham)
+```
+
